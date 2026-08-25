@@ -120,6 +120,10 @@ def main():
                      help="explicitly allow training on CPU (VERY slow, ~50-100x slower than a T4). "
                           "Without this flag the script exits immediately if no GPU is detected, "
                           "instead of silently training on CPU for hours.")
+    ap.add_argument("--patience", type=int, default=5,
+                     help="stop early if val mAP@0.5 doesn't improve for this many epochs "
+                          "(set to a number >= --epochs to disable). Mirrors ultralytics' patience "
+                          "so all 3 pipelines behave consistently under a tight time budget.")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -164,6 +168,7 @@ def main():
     print(f"AMP enabled: {scaler.is_enabled()}")
 
     best_map50 = -1.0
+    epochs_since_improvement = 0
     history = []
     train_start = time.time()
     for epoch in range(args.epochs):
@@ -175,7 +180,14 @@ def main():
         history.append({"epoch": epoch, "train_loss": avg_loss, **val_metrics})
         if map50 > best_map50:
             best_map50 = map50
+            epochs_since_improvement = 0
             torch.save(model.state_dict(), out_dir / "best.pt")
+        else:
+            epochs_since_improvement += 1
+            if epochs_since_improvement >= args.patience:
+                print(f"early stopping: val_map50 hasn't improved for {args.patience} epochs "
+                      f"(best={best_map50:.4f} at earlier epoch)")
+                break
     train_time_min = (time.time() - train_start) / 60
 
     torch.save(model.state_dict(), out_dir / "last.pt")
