@@ -30,6 +30,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from torchvision.models.detection import (
     fasterrcnn_resnet50_fpn_v2,
@@ -66,24 +67,35 @@ def evaluate(model, data_loader, device) -> dict:
     return {k: float(v) for k, v in result.items() if getattr(v, "numel", lambda: 1)() == 1}
 
 
-def train_one_epoch(model, optimizer, data_loader, device, epoch: int, print_freq: int = 20) -> float:
+def train_one_epoch(model, optimizer, data_loader, device, epoch: int, scaler=None, print_freq: int = 20) -> float:
     model.train()
     total_loss = 0.0
     n_batches = len(data_loader)
+    use_amp = scaler is not None
+    epoch_start = time.time()
     for i, (images, targets) in enumerate(data_loader):
-        images = [img.to(device) for img in images]
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-        loss_dict = model(images, targets)
-        loss = sum(loss_dict.values())
+        images = [img.to(device, non_blocking=True) for img in images]
+        targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        with autocast(device_type=device.type, enabled=use_amp):
+            loss_dict = model(images, targets)
+            loss = sum(loss_dict.values())
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
         if i % print_freq == 0:
-            print(f"  epoch {epoch} iter {i}/{n_batches} loss={loss.item():.4f}")
+            elapsed = time.time() - epoch_start
+            img_per_sec = ((i + 1) * data_loader.batch_size) / max(elapsed, 1e-6)
+            print(f"  epoch {epoch} iter {i}/{n_batches} loss={loss.item():.4f} "
+                  f"({img_per_sec:.1f} img/s -- if this is <10 img/s on a T4, something is wrong, see README)")
     return total_loss / max(1, n_batches)
 
 
@@ -102,6 +114,12 @@ def main():
     ap.add_argument("--min_size", type=int, default=800, help="shorter-side resize target (torchvision default 800)")
     ap.add_argument("--max_size", type=int, default=1333, help="longer-side cap (torchvision default 1333); "
                      "lowering both reduces T4 memory/time at some accuracy cost")
+    ap.add_argument("--amp", type=lambda x: x.lower() != "false", default=True,
+                     help="mixed-precision training (default on) -- roughly 1.5-2x faster on a T4's Tensor Cores")
+    ap.add_argument("--allow_cpu", action="store_true",
+                     help="explicitly allow training on CPU (VERY slow, ~50-100x slower than a T4). "
+                          "Without this flag the script exits immediately if no GPU is detected, "
+                          "instead of silently training on CPU for hours.")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -109,6 +127,15 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
+    if device.type == "cpu" and not args.allow_cpu:
+        raise SystemExit(
+            "\n*** No GPU detected (torch.cuda.is_available() == False) ***\n"
+            "Training Faster R-CNN on CPU is ~50-100x slower than a T4 and will take many hours.\n"
+            "This almost always means the Colab runtime type isn't actually set to a GPU yet --\n"
+            "go to Runtime > Change runtime type > T4 GPU, then Runtime > Restart session, then re-run\n"
+            "the notebook from the clone/pip-install cells (a runtime change requires a restart to take effect).\n"
+            "If you really want to proceed on CPU anyway (e.g. a tiny debug run), pass --allow_cpu."
+        )
 
     train_ds = CocoStyleDetection(args.train_json, transforms=build_transforms(train=True))
     val_ds = CocoStyleDetection(args.val_json, transforms=build_transforms(train=False))
@@ -117,11 +144,14 @@ def main():
           f"num_classes(+bg)={train_ds.num_classes_with_background}")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                               num_workers=args.num_workers, collate_fn=collate_fn)
+                               num_workers=args.num_workers, collate_fn=collate_fn,
+                               pin_memory=(device.type == "cuda"))
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=args.num_workers, collate_fn=collate_fn)
+                             num_workers=args.num_workers, collate_fn=collate_fn,
+                             pin_memory=(device.type == "cuda"))
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, collate_fn=collate_fn)
+                              num_workers=args.num_workers, collate_fn=collate_fn,
+                              pin_memory=(device.type == "cuda"))
 
     model = get_model(train_ds.num_classes_with_background, pretrained=not args.no_pretrained,
                        min_size=args.min_size, max_size=args.max_size)
@@ -130,12 +160,14 @@ def main():
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=5e-4)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(1, args.epochs // 2), gamma=0.1)
+    scaler = GradScaler(device.type, enabled=(args.amp and device.type == "cuda"))
+    print(f"AMP enabled: {scaler.is_enabled()}")
 
     best_map50 = -1.0
     history = []
     train_start = time.time()
     for epoch in range(args.epochs):
-        avg_loss = train_one_epoch(model, optimizer, train_loader, device, epoch)
+        avg_loss = train_one_epoch(model, optimizer, train_loader, device, epoch, scaler=scaler)
         lr_scheduler.step()
         val_metrics = evaluate(model, val_loader, device)
         map50 = val_metrics.get("map_50", -1.0)
