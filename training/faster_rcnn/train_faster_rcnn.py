@@ -124,6 +124,13 @@ def main():
                      help="stop early if val mAP@0.5 doesn't improve for this many epochs "
                           "(set to a number >= --epochs to disable). Mirrors ultralytics' patience "
                           "so all 3 pipelines behave consistently under a tight time budget.")
+    ap.add_argument("--resume", default=None,
+                     help="path to a checkpoint.pt written by a previous (interrupted) run of THIS "
+                          "script. Restores model/optimizer/scheduler/scaler state and continues from "
+                          "the next epoch, so a Colab disconnect only costs the current in-progress "
+                          "epoch, not the whole run. Pass the SAME --train_json/--val_json/--test_json/"
+                          "--min_size/--max_size/etc used originally -- only --epochs and --patience are "
+                          "safe to change on resume.")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -169,9 +176,30 @@ def main():
 
     best_map50 = -1.0
     epochs_since_improvement = 0
+    best_model_state = None
     history = []
+    start_epoch = 0
+    prior_train_time_min = 0.0
+
+    if args.resume:
+        print(f"resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        lr_scheduler.load_state_dict(ckpt["scheduler"])
+        if ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_map50 = ckpt["best_map50"]
+        epochs_since_improvement = ckpt["epochs_since_improvement"]
+        best_model_state = ckpt.get("best_model")
+        history = ckpt.get("history", [])
+        prior_train_time_min = ckpt.get("cumulative_train_time_min", 0.0)
+        print(f"resumed at epoch {start_epoch}, best_map50 so far={best_map50:.4f}, "
+              f"prior training time={prior_train_time_min:.1f} min")
+
     train_start = time.time()
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         avg_loss = train_one_epoch(model, optimizer, train_loader, device, epoch, scaler=scaler)
         lr_scheduler.step()
         val_metrics = evaluate(model, val_loader, device)
@@ -181,18 +209,42 @@ def main():
         if map50 > best_map50:
             best_map50 = map50
             epochs_since_improvement = 0
-            torch.save(model.state_dict(), out_dir / "best.pt")
+            best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            torch.save(best_model_state, out_dir / "best.pt")
         else:
             epochs_since_improvement += 1
-            if epochs_since_improvement >= args.patience:
-                print(f"early stopping: val_map50 hasn't improved for {args.patience} epochs "
-                      f"(best={best_map50:.4f} at earlier epoch)")
-                break
-    train_time_min = (time.time() - train_start) / 60
+
+        # Full state checkpoint written EVERY epoch (not just on improvement) so a Colab
+        # disconnect never costs more than the current in-progress epoch. This single file
+        # is enough to --resume in a fresh session (it embeds the best weights too, in case
+        # best.pt itself wasn't downloaded separately).
+        torch.save({
+            "model": model.state_dict(),
+            "best_model": best_model_state,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": lr_scheduler.state_dict(),
+            "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+            "epoch": epoch,
+            "best_map50": best_map50,
+            "epochs_since_improvement": epochs_since_improvement,
+            "history": history,
+            "cumulative_train_time_min": prior_train_time_min + (time.time() - train_start) / 60,
+        }, out_dir / "checkpoint.pt")
+
+        if epochs_since_improvement >= args.patience:
+            print(f"early stopping: val_map50 hasn't improved for {args.patience} epochs "
+                  f"(best={best_map50:.4f} at earlier epoch)")
+            break
+    train_time_min = prior_train_time_min + (time.time() - train_start) / 60
 
     torch.save(model.state_dict(), out_dir / "last.pt")
-    # evaluate the BEST checkpoint (by val mAP50) on the held-out test set
-    model.load_state_dict(torch.load(out_dir / "best.pt", map_location=device))
+    # evaluate the BEST checkpoint (by val mAP50) on the held-out test set. Prefer the
+    # in-memory copy (works even right after a --resume that finished with 0 new epochs);
+    # fall back to reading best.pt from disk otherwise.
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    else:
+        model.load_state_dict(torch.load(out_dir / "best.pt", map_location=device))
     test_metrics = evaluate(model, test_loader, device)
     print("test metrics (best checkpoint):", test_metrics)
 
