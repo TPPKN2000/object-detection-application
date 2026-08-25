@@ -1,0 +1,12 @@
+path: /content/yolo_data
+train: images/train
+val: images/val
+test: images/test
+nc: 6
+names:
+- person
+- bicycle
+- car
+- motorbike
+- bus
+- train
