@@ -13,31 +13,6 @@ this project's 3-way comparison.
 We fine-tune from COCO-pretrained weights (not from scratch) specifically so
 training converges in a handful of epochs on a single Colab T4.
 
---- PATCH NOTES (speed/robustness pass, same training scope/quality) -------
-1. PREFLIGHT CHECK: right after datasets are built (before any GPU work),
-   we open the first few images of train/val/test to confirm paths resolve.
-   This turns a "burn 2h of T4 then crash at eval" failure into a "fail in
-   under 5 seconds" failure -- directly targeting the symlink/stale-path
-   issue that hit the YOLOv8 run in this project.
-2. num_workers kept at 2 (matches this Colab free-tier VM's actual 2 physical
-   cores -- a --num_workers 4 experiment made throughput far WORSE, ~0.3-0.6
-   img/s, due to CPU oversubscription/context-switch thrashing, confirmed by
-   PyTorch's own "suggested max number of workers is 2" warning). Added
-   persistent_workers + prefetch_factor (still a real win at the correct
-   worker count -- avoids worker respawn overhead every epoch) and
-   torch.set_num_threads(1) on the main process so it doesn't compete with
-   the 2 workers for the same 2 cores.
-3. cudnn.benchmark = True on CUDA (free, usually net positive even with the
-   per-batch size variation from aspect-ratio-preserving resize).
-4. Removed the per-ITERATION .item() sync for the running loss -- only
-   syncs at print_freq boundaries and at epoch end now.
-5. Optional --channels_last flag (default OFF): experimental, torchvision
-   detection models aren't guaranteed to benefit/behave identically, so this
-   is opt-in, not a default.
-None of these change epoch count, image resolution, batch composition, or
-any other factor that affects the trained model's final accuracy.
------------------------------------------------------------------------------
-
 Usage:
     python train_faster_rcnn.py \
         --train_json /content/coco/train.json \
@@ -54,7 +29,6 @@ import time
 from pathlib import Path
 
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
@@ -78,36 +52,6 @@ def get_model(num_classes_with_bg: int, pretrained: bool = True, min_size: int =
     return model
 
 
-def preflight_check(name: str, dataset: "CocoStyleDetection", n_sample: int = 5) -> None:
-    """Fail fast (seconds) instead of failing after hours of training.
-    Opens the first n_sample images of a split via PIL and confirms the
-    abs_path actually resolves to a readable image. This is exactly the
-    class of bug that made the YOLOv8 run in this project burn its full
-    training time only to crash at the final test-set eval because of a
-    stale/broken data.yaml -> image path chain.
-    """
-    if len(dataset) == 0:
-        raise SystemExit(f"[preflight] {name}: dataset is EMPTY (0 images) -- "
-                          f"check the json/path passed in before starting training.")
-    n = min(n_sample, len(dataset))
-    for i in range(n):
-        img_info = dataset.images[dataset.image_ids[i]]
-        abs_path = img_info["abs_path"]
-        try:
-            with Image.open(abs_path) as im:
-                im.verify()
-        except Exception as e:
-            raise SystemExit(
-                f"[preflight] {name}: FAILED to open image #{i} at '{abs_path}' ({e}).\n"
-                f"This almost always means the dataset was prepared in a DIFFERENT session/path "
-                f"than the one this script is running in now (e.g. a symlink target that no longer "
-                f"exists, or a stale committed json/yaml). Regenerate coco/yolo_data fresh in THIS "
-                f"session (re-run the Phase A cells) before training, rather than reusing a "
-                f"previously-committed copy."
-            )
-    print(f"[preflight] {name}: OK ({len(dataset)} images, sampled {n} readable)")
-
-
 @torch.no_grad()
 def evaluate(model, data_loader, device) -> dict:
     model.eval()
@@ -125,19 +69,15 @@ def evaluate(model, data_loader, device) -> dict:
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch: int, scaler=None, print_freq: int = 20) -> float:
     model.train()
+    total_loss = 0.0
     n_batches = len(data_loader)
     use_amp = scaler is not None
     epoch_start = time.time()
-
-    # Accumulate loss as a GPU tensor and only sync to host (.item()) at
-    # print boundaries / epoch end, instead of every single iteration.
-    running_loss = torch.zeros((), device=device)
-
     for i, (images, targets) in enumerate(data_loader):
         images = [img.to(device, non_blocking=True) for img in images]
         targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
         with autocast(device_type=device.type, enabled=use_amp):
             loss_dict = model(images, targets)
             loss = sum(loss_dict.values())
@@ -150,16 +90,13 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch: int, scaler=No
             loss.backward()
             optimizer.step()
 
-        running_loss += loss.detach()
-
+        total_loss += loss.item()
         if i % print_freq == 0:
-            loss_value = loss.item()  # only sync here, not every iteration
             elapsed = time.time() - epoch_start
             img_per_sec = ((i + 1) * data_loader.batch_size) / max(elapsed, 1e-6)
-            print(f"  epoch {epoch} iter {i}/{n_batches} loss={loss_value:.4f} "
+            print(f"  epoch {epoch} iter {i}/{n_batches} loss={loss.item():.4f} "
                   f"({img_per_sec:.1f} img/s -- if this is <10 img/s on a T4, something is wrong, see README)")
-
-    return (running_loss / max(1, n_batches)).item()
+    return total_loss / max(1, n_batches)
 
 
 def main():
@@ -171,22 +108,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--lr", type=float, default=0.005)
-    ap.add_argument("--num_workers", type=int, default=2,
-                     help="CORRECTED back to 2 after testing: this Colab free-tier VM only has 2 real "
-                          "CPU cores (confirmed by PyTorch's own 'suggested max number of workers is 2' "
-                          "warning when --num_workers 4 was tried). Spawning more worker processes than "
-                          "physical cores causes OS-level context-switch thrashing, which made throughput "
-                          "far WORSE (0.3-0.6 img/s) than the original default. Only raise this above 2 "
-                          "if `!nproc` in Colab reports more cores than that.")
-    ap.add_argument("--prefetch_factor", type=int, default=4,
-                     help="only used when --num_workers > 0")
-    ap.add_argument("--channels_last", action="store_true",
-                     help="EXPERIMENTAL: convert model+inputs to channels_last memory format for "
-                          "potential Tensor Core speedup on the T4. Off by default -- torchvision "
-                          "detection models are not guaranteed to fully support/benefit from this, "
-                          "test it on a short run before trusting it for the full training.")
-    ap.add_argument("--skip_preflight", action="store_true",
-                     help="skip the fast dataset-path sanity check (not recommended)")
+    ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--no_pretrained", action="store_true",
                      help="train from scratch instead of COCO-pretrained weights (NOT recommended on T4)")
     ap.add_argument("--min_size", type=int, default=800, help="shorter-side resize target (torchvision default 800)")
@@ -225,13 +147,6 @@ def main():
             "the notebook from the clone/pip-install cells (a runtime change requires a restart to take effect).\n"
             "If you really want to proceed on CPU anyway (e.g. a tiny debug run), pass --allow_cpu."
         )
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True  # free speedup for the (mostly-)fixed input size range
-        # Leave both CPU cores as free as possible for the DataLoader workers -- the main
-        # process's own compute is almost entirely on the GPU, so it doesn't need PyTorch's
-        # default intra-op CPU thread pool, which would otherwise compete with the 2 workers
-        # for the same 2 physical cores on this Colab free-tier VM.
-        torch.set_num_threads(1)
 
     train_ds = CocoStyleDetection(args.train_json, transforms=build_transforms(train=True))
     val_ds = CocoStyleDetection(args.val_json, transforms=build_transforms(train=False))
@@ -239,27 +154,19 @@ def main():
     print(f"train={len(train_ds)} val={len(val_ds)} test={len(test_ds)} "
           f"num_classes(+bg)={train_ds.num_classes_with_background}")
 
-    if not args.skip_preflight:
-        preflight_check("train", train_ds)
-        preflight_check("val", val_ds)
-        preflight_check("test", test_ds)
-
-    loader_kwargs = dict(num_workers=args.num_workers, collate_fn=collate_fn,
-                          pin_memory=(device.type == "cuda"))
-    if args.num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                               num_workers=args.num_workers, collate_fn=collate_fn,
+                               pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                             num_workers=args.num_workers, collate_fn=collate_fn,
+                             pin_memory=(device.type == "cuda"))
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
+                              num_workers=args.num_workers, collate_fn=collate_fn,
+                              pin_memory=(device.type == "cuda"))
 
     model = get_model(train_ds.num_classes_with_background, pretrained=not args.no_pretrained,
                        min_size=args.min_size, max_size=args.max_size)
     model.to(device)
-    if args.channels_last:
-        model.to(memory_format=torch.channels_last)
-        print("channels_last: ON (experimental)")
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=5e-4)
