@@ -19,10 +19,14 @@ training converges in a handful of epochs on a single Colab T4.
    This turns a "burn 2h of T4 then crash at eval" failure into a "fail in
    under 5 seconds" failure -- directly targeting the symlink/stale-path
    issue that hit the YOLOv8 run in this project.
-2. num_workers default raised 2 -> 4 (still overridable), + persistent_workers
-   + prefetch_factor, to fix the CPU-bound data-loading bottleneck that was
-   capping throughput at ~6.2-6.5 img/s instead of the 9-14 img/s the
-   original 8-batch/600-1000px config should reach on a T4.
+2. num_workers kept at 2 (matches this Colab free-tier VM's actual 2 physical
+   cores -- a --num_workers 4 experiment made throughput far WORSE, ~0.3-0.6
+   img/s, due to CPU oversubscription/context-switch thrashing, confirmed by
+   PyTorch's own "suggested max number of workers is 2" warning). Added
+   persistent_workers + prefetch_factor (still a real win at the correct
+   worker count -- avoids worker respawn overhead every epoch) and
+   torch.set_num_threads(1) on the main process so it doesn't compete with
+   the 2 workers for the same 2 cores.
 3. cudnn.benchmark = True on CUDA (free, usually net positive even with the
    per-batch size variation from aspect-ratio-preserving resize).
 4. Removed the per-ITERATION .item() sync for the running loss -- only
@@ -167,11 +171,13 @@ def main():
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--lr", type=float, default=0.005)
-    ap.add_argument("--num_workers", type=int, default=4,
-                     help="raised from the old default of 2: on the T4 img/s logged during the last "
-                          "run, throughput plateaued at ~6.2-6.5 img/s (vs. 9-14 expected) which points "
-                          "to a CPU-bound data-loading bottleneck at 2 workers. Check `!nproc` in Colab "
-                          "to see how many are actually available and raise further if you have >4 cores.")
+    ap.add_argument("--num_workers", type=int, default=2,
+                     help="CORRECTED back to 2 after testing: this Colab free-tier VM only has 2 real "
+                          "CPU cores (confirmed by PyTorch's own 'suggested max number of workers is 2' "
+                          "warning when --num_workers 4 was tried). Spawning more worker processes than "
+                          "physical cores causes OS-level context-switch thrashing, which made throughput "
+                          "far WORSE (0.3-0.6 img/s) than the original default. Only raise this above 2 "
+                          "if `!nproc` in Colab reports more cores than that.")
     ap.add_argument("--prefetch_factor", type=int, default=4,
                      help="only used when --num_workers > 0")
     ap.add_argument("--channels_last", action="store_true",
@@ -221,6 +227,11 @@ def main():
         )
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True  # free speedup for the (mostly-)fixed input size range
+        # Leave both CPU cores as free as possible for the DataLoader workers -- the main
+        # process's own compute is almost entirely on the GPU, so it doesn't need PyTorch's
+        # default intra-op CPU thread pool, which would otherwise compete with the 2 workers
+        # for the same 2 physical cores on this Colab free-tier VM.
+        torch.set_num_threads(1)
 
     train_ds = CocoStyleDetection(args.train_json, transforms=build_transforms(train=True))
     val_ds = CocoStyleDetection(args.val_json, transforms=build_transforms(train=False))
