@@ -1,0 +1,17 @@
+{
+  "model_name": "RT-DETR-L",
+  "paper": "Lv et al., DETRs Beat YOLOs on Real-Time Object Detection, 2023",
+  "num_params": 31996070,
+  "train_time_min": 340.1003673950831,
+  "test_metrics": {
+    "metrics/precision(B)": 0.891355054892433,
+    "metrics/recall(B)": 0.8337313156969447,
+    "metrics/mAP50(B)": 0.8984992266601965,
+    "metrics/mAP50-95(B)": 0.705105252508219,
+    "fitness": 0.705105252508219
+  },
+  "fps": 24.03198052855445,
+  "latency_ms": 41.61121880120594,
+  "epochs": 30,
+  "batch_size": 8
+}

@@ -1,0 +1,28 @@
+{
+  "model_name": "Faster R-CNN (ResNet50-FPN v2)",
+  "paper": "Ren et al., Faster R-CNN, NeurIPS 2015",
+  "num_params": 43281778,
+  "train_time_min": 186.78475263118744,
+  "best_val_map50": 0.9048504829406738,
+  "test_metrics": {
+    "map": 0.7135215401649475,
+    "map_50": 0.940041184425354,
+    "map_75": 0.8055539131164551,
+    "map_small": 0.48587989807128906,
+    "map_medium": 0.5613020658493042,
+    "map_large": 0.7724887132644653,
+    "mar_1": 0.5692551136016846,
+    "mar_10": 0.7846193313598633,
+    "mar_100": 0.7874929308891296,
+    "mar_small": 0.717974066734314,
+    "mar_medium": 0.6757196187973022,
+    "mar_large": 0.8322247862815857,
+    "map_per_class": -1.0,
+    "mar_100_per_class": -1.0
+  },
+  "fps": 7.673990016270565,
+  "latency_ms": 130.31030766000185,
+  "epochs": 8,
+  "batch_size": 8,
+  "device": "cuda"
+}

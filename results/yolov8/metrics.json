@@ -1,0 +1,17 @@
+{
+  "model_name": "YOLOv8s",
+  "paper": "Redmon et al. YOLO lineage (Ultralytics implementation, no single canonical v8 paper)",
+  "num_params": 11127906,
+  "train_time_min": 125.0700384537379,
+  "test_metrics": {
+    "metrics/precision(B)": 0.8760173478459445,
+    "metrics/recall(B)": 0.7942334608533885,
+    "metrics/mAP50(B)": 0.8733001247959732,
+    "metrics/mAP50-95(B)": 0.6468679638683377,
+    "fitness": 0.6468679638683377
+  },
+  "fps": 148.09402992862059,
+  "latency_ms": 6.7524666624440375,
+  "epochs": 50,
+  "batch_size": 16
+}
