@@ -1,0 +1,6 @@
+gradio>=4.36
+spaces>=0.28
+torch
+torchvision
+ultralytics>=8.2
+pillow>=10.0
